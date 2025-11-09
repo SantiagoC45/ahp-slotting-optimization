@@ -6,34 +6,47 @@ from sklearn.metrics import pairwise_distances
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 import ahpy
 
-def compute_summary(df, sku_col='SKU', aggregations=None):
+def compute_summary(df, sku_col='SKU', mode='Shipping', aggregations=None):
     """
-    Agrupa por SKU y devuelve un resumen con Qty Shipped, Weight [Kg], Boxes.
-    Si las columnas no existen, intenta encontrar nombres parecidos.
+    Agrupa por SKU y devuelve un resumen:
+      - Si mode='shipping': Qty Shipped, Weight [Kg], Boxes
+      - Si mode='labor': Weight [Kg], Pick Unit
+    Si las columnas no existen, las crea con 0 para evitar errores.
     """
-    # Por defecto, usar estas columnas si existen
-    defaults = {'Qty Shipped': 'Qty Shipped', 'Weight [Kg]': 'Weight [Kg]', 'Boxes': 'Boxes'}
+    # Definir columnas por defecto según modo
+    defaults = {
+        'Shipping': {'Qty Shipped': 'Qty Shipped', 'Weight [Kg]': 'Weight [Kg]', 'Boxes': 'Boxes'},
+        'Labor': {'Weight [Kg]': 'Weight [Kg]', 'Pick Unit': 'Pick Unit'}
+    }
+
+    # Determinar agregaciones base
     if aggregations is None:
-        aggregations = defaults
-    # Asegurar existencia de columnas: si no existen, crear columnas con 0
+        aggregations = defaults.get(mode.lower(), defaults[mode])
+
+    # Asegurar existencia de columnas
     for col in aggregations.values():
         if col not in df.columns:
             df[col] = 0
-    # Agrupar
-    summary = df.groupby(sku_col).agg({
-        aggregations['Qty Shipped']: 'sum',
-        aggregations['Weight [Kg]']: 'sum',
-        aggregations['Boxes']: 'sum'
-    }).reset_index().rename(columns={
-        aggregations['Qty Shipped']: 'Qty Shipped',
-        aggregations['Weight [Kg]']: 'Weight [Kg]',
-        aggregations['Boxes']: 'Boxes'
-    })
+
+    # Preparar diccionario para agregación
+    agg_dict = {v: 'sum' for v in aggregations.values()}
+
+    # Agrupar y renombrar
+    summary = (
+        df.groupby(sku_col)
+          .agg(agg_dict)
+          .reset_index()
+          .rename(columns={v: k for k, v in aggregations.items()})
+    )
+
     # Evitar NaNs
-    summary[['Qty Shipped','Weight [Kg]','Boxes']] = summary[['Qty Shipped','Weight [Kg]','Boxes']].fillna(0)
+    for col in aggregations.keys():
+        summary[col] = summary[col].fillna(0)
+
     return summary
 
-def compute_abc(summary, qty_col='Qty Shipped', cuts=[80,90]):
+
+def compute_abc(summary, qty_col, cuts=[80,90]):
     """
     Clasificación ABC clásica por Pareto basada en `qty_col`.
     - cuts: lista con percentiles acumulativos (ej [80,90]) => A: <=80, B: >80-90, C: >90-100
@@ -60,7 +73,7 @@ def compute_abc(summary, qty_col='Qty Shipped', cuts=[80,90]):
     df['ABC_class'] = df['cum%'].apply(classify)
     return df
 
-def compute_ahp(summary, features, comparisons_dict, cuts=[80,90]):
+def compute_ahp(summary, features, comparisons_dict, cuts=[80,90], w=None):
     """
     Ejecuta AHP con ahpy usando comparisons_dict (pares de comparaciones) y calcula AHP_score.
     - features: lista de columnas sobre las que construir el score (columnas numéricas de summary)
@@ -80,8 +93,13 @@ def compute_ahp(summary, features, comparisons_dict, cuts=[80,90]):
 
     # Ejecutar ahpy: Construir objeto Compare
     #try:
-    criteria = ahpy.Compare('criteria', comparisons=comparisons_dict, precision=6)
-    weights = criteria.target_weights  # dict {feature: weight}
+    if w:
+        criteria = None
+        weights = w
+    else:  
+        criteria = ahpy.Compare('criteria', comparisons=comparisons_dict, precision=6)
+        weights = criteria.target_weights  # dict {feature: weight}
+
     # Asegurar que todos features tengan un peso (si el usuario escribió pesos directos, manejar)
     weights_list = [weights.get(f, 0) for f in features]
     #except Exception as e:
