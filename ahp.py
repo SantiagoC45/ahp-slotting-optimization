@@ -207,3 +207,179 @@ def compute_similarity_metrics(summary, features, class_col='AHP_class'):
         global_idx['calinski_harabasz'] = np.nan
 
     return df_metrics, global_idx
+
+
+# -----------------------------
+# NUEVAS FUNCIONES: manejo de forecast/demand y reclasificación
+# -----------------------------
+
+def get_quarter_from_date(date):
+    """Devuelve Q1..Q4 según el mes de una fecha (acepta pandas Timestamp)."""
+    if pd.isna(date):
+        return None
+    m = date.month
+    if 1 <= m <= 3:
+        return "Q1"
+    elif 4 <= m <= 6:
+        return "Q2"
+    elif 7 <= m <= 9:
+        return "Q3"
+    else:
+        return "Q4"
+
+
+def make_abc_classification(df, sku_col="SKU", qty_cols=("Qty", "Delivered Qty")):
+    """
+    Crea una clasificación ABC basada en la primera columna de cantidad que encuentre en qty_cols.
+    Devuelve DataFrame con columnas: SKU, Used_Qty, cum_qty, cum_pct, ABC_class
+    """
+    temp = df.copy()
+    # detectar columna qty válida
+    qty_col = None
+    for col in qty_cols:
+        if col in temp.columns:
+            qty_col = col
+            break
+    if qty_col is None:
+        raise ValueError("No se encontró 'Qty' ni 'Delivered Qty' en el dataset.")
+
+    # Normalizar SKU a str y mayúsculas si existe
+    if sku_col in temp.columns:
+        temp[sku_col] = temp[sku_col].astype(str).str.upper()
+    else:
+        raise ValueError(f"No se encontró la columna SKU ('{sku_col}') en el dataset.")
+
+    # Agrupar por SKU sumando la cantidad detectada
+    temp = temp.groupby(sku_col)[qty_col].sum().reset_index()
+    temp = temp.sort_values(qty_col, ascending=False).reset_index(drop=True)
+    temp = temp.rename(columns={qty_col: "Used_Qty"})
+    temp["cum_qty"] = temp["Used_Qty"].cumsum()
+    total = temp["Used_Qty"].sum()
+    if total == 0:
+        temp["cum_pct"] = 0.0
+    else:
+        temp["cum_pct"] = 100 * temp["cum_qty"] / total
+
+    temp["ABC_class"] = pd.cut(
+        temp["cum_pct"],
+        bins=[-0.001, 80, 90, 100],
+        labels=["A", "B", "C"],
+        include_lowest=True
+    ).astype(str)
+
+    return temp
+
+
+def reclasify_final(row):
+    """
+    Dado un row con columnas 'LABOR_AHP_class' y 'ABC_class' devuelve (Final_class, Source).
+    Source indica si la clase final viene de 'LABOR' o 'ABC'.
+    """
+    labor_class = row.get("LABOR_AHP_class", None)
+    abc_class = row.get("ABC_class", None)
+    # Si no hay ABC (improbable), devolver LABOR si existe
+    if pd.isna(abc_class) or abc_class is None:
+        return labor_class, "LABOR" if not pd.isna(labor_class) else None
+
+    # Si no hay LABOR -> usar ABC
+    if pd.isna(labor_class) or labor_class is None:
+        return abc_class, "ABC"
+
+    # Si coinciden -> mantener LABOR
+    if labor_class == abc_class:
+        return labor_class, "LABOR"
+
+    # Si difieren -> categoría con mayor prioridad (A > B > C)
+    priority = {"A": 3, "B": 2, "C": 1}
+    # seguridad: si hay valores extraños, fallback a ABC
+    if labor_class not in priority or abc_class not in priority:
+        return abc_class, "ABC"
+    final_class = labor_class if priority[labor_class] >= priority[abc_class] else abc_class
+    source = "LABOR" if final_class == labor_class else "ABC"
+    return final_class, source
+
+
+def process_single_quarter(df_q, labor_small, quarter_name="Qx"):
+    """
+    Procesa un dataframe representando un trimestre/forecast sin mezclar con otros,
+    aplica ABC por SKU, merge con labor_small (SKU, LABOR_AHP_class, LABOR_cum_pct),
+    aplica reclasificación y devuelve df con columnas relevantes.
+    """
+    # 1. ABC
+    abc_df = make_abc_classification(df_q)
+
+    # 2. Merge con LABOR (labor_small: SKU, LABOR_AHP_class, LABOR_cum_pct)
+    merged = pd.merge(
+        abc_df,
+        labor_small,
+        on="SKU",
+        how="left"
+    )
+
+    # 3. Reclasificación (devuelve dos columnas)
+    results = merged.apply(lambda r: reclasify_final(r), axis=1, result_type="expand")
+    merged["Final_class"] = results[0]
+    merged["Source"] = results[1]
+
+    # 4. Cambio frente a LABOR
+    merged["Changed"] = merged["Final_class"] != merged["LABOR_AHP_class"]
+
+    # 5. Nombre de Quarter
+    merged["Quarter"] = quarter_name
+
+    n = len(merged)
+    pct_change = 100 * merged["Changed"].mean() if n > 0 else 0.0
+
+    # Añadir conteos rápidos
+    merged["Used_Qty"] = merged["Used_Qty"].fillna(0)
+
+    return merged
+
+
+def process_dataset(df, labor_small, dataset_name="Dataset"):
+    """
+    Procesa un dataset de demanda/forecast que puede:
+      - no tener columna de fecha (entonces detecta Q en el nombre del dataset)
+      - o tener columna de fecha (separa por trimestres usando get_quarter_from_date)
+    Devuelve concatenación de resultados por quarter.
+    """
+    # 1. Detectar columna fecha
+    date_cols = ["Inventory Date", "Date", "date", "Fecha", "inventory_date"]
+    date_col = None
+    for col in date_cols:
+        if col in df.columns:
+            date_col = col
+            break
+
+    # Normalize SKU column name
+    if "SKU" in df.columns:
+        df["SKU"] = df["SKU"].astype(str).str.upper()
+
+    # CASO A: no hay fecha -> intentar detectar Q por dataset_name
+    if date_col is None:
+        name_lower = dataset_name.lower()
+        detected_q = None
+        for q in ["Q1", "Q2", "Q3", "Q4"]:
+            if q.lower() in name_lower:
+                detected_q = q
+                break
+        quarter_label = detected_q if detected_q else dataset_name
+        result = process_single_quarter(df, labor_small, quarter_label)
+        return result
+
+    # CASO B: tiene fechas -> separar por trimestre
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df = df.dropna(subset=[date_col])
+    df["Quarter_auto"] = df[date_col].apply(get_quarter_from_date)
+    all_results = []
+    for q in sorted(df["Quarter_auto"].dropna().unique()):
+        df_q = df[df["Quarter_auto"] == q]
+        base_name = dataset_name.split()[0] if dataset_name else "Demand"
+        q_name = f"{base_name} {q}"  
+        result_q = process_single_quarter(df_q, labor_small, q_name)
+        all_results.append(result_q)
+    if not all_results:
+        return pd.DataFrame()
+    return pd.concat(all_results, ignore_index=True)
+

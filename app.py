@@ -2,6 +2,7 @@
 """
 App Streamlit: clasificación ABC vs AHP para Shipping y Labor.
 Mantener nombres de pestañas: "Shipping Detail Report" y "Labor Activity Report".
+Se añadió sección para subir archivos de Demanda/Forecast y reclasificación.
 """
 
 import streamlit as st
@@ -11,8 +12,15 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import seaborn as sns
 import json2html
+from io import BytesIO
+import io
+from st_aggrid import AgGrid, GridOptionsBuilder
 
-from ahp import compute_abc, compute_ahp, compute_similarity_metrics, compute_summary
+
+from ahp import (
+    compute_abc, compute_ahp, compute_similarity_metrics, compute_summary,
+    get_quarter_from_date, make_abc_classification, process_dataset, reclasify_final
+)
 
 
 # --- CACHE Y FUNCIONES AUXILIARES ---
@@ -102,7 +110,6 @@ cuts = [cut_a, cut_b]
 # ---------------------------
 # Selección columnas SKU y agregación
 # ---------------------------
-#st.sidebar.subheader("Columnas clave y agregación")
 sku_col_ship = "SKU"
 qty_col_ship = "Qty Shipped"
 weight_col_ship = "Weight [Kg]"
@@ -174,16 +181,13 @@ if len(features) < 2:
     st.warning("Selecciona al menos 2 features para ejecutar AHP.")
     st.stop()
 
-# Construir dataframe triangular para edición
 pairs = []
 for i in range(len(features)):
     for j in range(i+1, len(features)):
         pairs.append({'feature_i': features[i], 'feature_j': features[j], 'value': 1.0})
 
 pairs_df = pd.DataFrame(pairs)
-# Mostrar editor del dataframe
 edited_pairs = st.data_editor(pairs_df, num_rows="dynamic", key="ahp_pairs_editor")
-
 
 # Convertir a comparisons dict para ahpy
 comparisons = {}
@@ -201,8 +205,6 @@ use_manual_weights = st.checkbox("Usar pesos manuales (si activo, la matriz se i
 
 if use_manual_weights:
     col1, col2 = st.columns(2)
-
-    # Ingreso de pesos manuales
     for f in features:
         weights_manual[f] = col1.number_input(
             f"Peso {f}",
@@ -211,31 +213,30 @@ if use_manual_weights:
             step=0.05,
             key=f"w_{f}"
         )
-
-    # Calcular suma total
     total_w = sum(weights_manual.values())
-
-    # Mostrar barra de progreso visual
     st.markdown(f"**Suma actual de pesos:** {total_w:.3f}")
-    progress_value = min(total_w, 1.0)  # evita pasar de 100%
+    progress_value = min(total_w, 1.0)
     st.progress(progress_value)
-
-    # Verificar si la suma es válida
     if abs(total_w - 1.0) > 1e-6:
-        st.warning(f"La suma de los pesos ({total_w:.2f}) debe ser exactamente 1. "
-                   "Ajusta los valores antes de continuar.")
+        st.warning(f"La suma de los pesos ({total_w:.2f}) debe ser exactamente 1. Ajusta los valores antes de continuar.")
         st.stop()
     else:
-        # Normalizar pesos (por si hay redondeos)
         for k in weights_manual:
             weights_manual[k] = weights_manual[k] / total_w
         st.success("✅ Pesos válidos: la suma es 1.")
 
+# ---------------------------
+# NUEVA SECCIÓN: Upload de archivos de Demand / Forecast
+# ---------------------------
+if view_mode == 'Labor':
 
-# ---------------------------
+    st.sidebar.subheader("Demand / Forecast")
+    st.sidebar.markdown("Puedes subir uno o varios archivos de demanda/forecast (Excel o CSV). El flujo detecta si el archivo tiene columna fecha o no y procesa por trimestre si aplica.")
+    demand_files = st.sidebar.file_uploader("Sube archivos Demand/Forecast (xlsx/csv)", accept_multiple_files=True, type=['xlsx','xls','csv'])
+
 # Botón ejecutar
-# ---------------------------
 if st.button("Ejecutar clasificación y métricas"):
+    # --- Preparar df_use y sku col según modo ---
     if view_mode == 'Shipping':
         df_use = df_ship.copy()
         sku_col = sku_col_ship
@@ -243,11 +244,10 @@ if st.button("Ejecutar clasificación y métricas"):
         df_use = df_labor.copy()
         sku_col = sku_col_labor
 
-    # Construir 'aggregations' dinámicamente en base a las features seleccionadas
+    # Construir aggregations basadas en features seleccionadas
     if use_features and len(use_features) > 0:
         aggregations = {col: col for col in use_features}
     else:
-        # Fallback: usar columnas por defecto según el modo
         if view_mode == 'Shipping':
             aggregations = {
                 'Qty Shipped': qty_col_ship,
@@ -266,83 +266,47 @@ if st.button("Ejecutar clasificación y métricas"):
     # ABC clásico
     if view_mode == 'Shipping':
         qty_col = 'Qty Shipped'
-    else:  # labor
+    else:
         qty_col = 'Pick Unit'
 
     abc_df = compute_abc(summary, qty_col=qty_col, cuts=cuts)
 
-
-    # AHP: construir comparisons dict (si usan pesos manuales, creamos comparisons que reflejen esos pesos)
+    # AHP
     if use_manual_weights:
         ahp_summary, criteria = compute_ahp(summary, features=features, comparisons_dict=comparisons, cuts=cuts, w=weights_manual)
     else:
-        comparisons_to_use = comparisons
         ahp_summary, criteria = compute_ahp(summary, features=features, comparisons_dict=comparisons, cuts=cuts)
 
-    # Unir ABC clásico y AHP en un solo df comparativo (usar SKU como key)
-    
+    # Merged principal
     abc_cols = ['SKU'] + use_features + ['cum%', 'ABC_class']
-
-    # Asegurar que solo se usen columnas que existen
     abc_cols = [c for c in abc_cols if c in abc_df.columns]
-
-    # Asegurar que las columnas AHP estén disponibles
     ahp_cols = ['SKU', 'AHP_score', 'cum_AHP%', 'AHP_class'] + [f'{f}_norm' for f in features if f'{f}_norm' in ahp_summary.columns]
+    merged = pd.merge(abc_df[abc_cols], ahp_summary[ahp_cols], on='SKU', how='outer').fillna(0)
 
-    # Hacer el merge
-    merged = (
-        pd.merge(
-            abc_df[abc_cols],
-            ahp_summary[ahp_cols],
-            on='SKU',
-            how='outer'
-        )
-        .fillna(0)
-    )
-
-    # Mostrar reporte ahpy si estuvo bien construido
+    # Mostrar reporte AHP
     if criteria is not None:
-        st.subheader("Reporte AHP (ahpy)")
         try:
-            if criteria is not None:
-                # Obtener Consistency Ratio
-                cr = getattr(criteria, 'consistency_ratio', None)
-
-                # Mostrar el CR
-                if cr is not None:
-                    if cr > 0.1:
-                        st.warning(f"Consistency ratio AHP = {cr:.3f} > 0.1. Revisa la matriz de comparaciones; puede no ser consistente.")
-                    else:
-                        st.success(f"Consistency ratio AHP = {cr:.3f}. Consistencia aceptable.")
+            cr = getattr(criteria, 'consistency_ratio', None)
+            if cr is not None:
+                if cr > 0.1:
+                    st.warning(f"Consistency ratio AHP = {cr:.3f} > 0.1. Revisa la matriz de comparaciones; puede no ser consistente.")
                 else:
-                    st.info("No se encontró el atributo 'consistency_ratio' en el objeto AHP.")
-
-                # Mostrar los pesos obtenidos por criterio
-                try:
-                    weights = criteria.target_weights
-                    if weights:
-                        st.subheader("Pesos obtenidos por criterio (AHP)")
-                        weights_df = pd.DataFrame(list(weights.items()), columns=["Criterio", "Peso"])
-                        weights_df["Peso"] = weights_df["Peso"].round(4)
-                        st.table(weights_df)
-                    else:
-                        st.warning("No se encontraron pesos en el objeto 'criteria'.")
-                except Exception as e:
-                    st.warning(f"No fue posible obtener los pesos del objeto AHP: {e}")
-
-            else:
-                st.info("No se generó un objeto 'criteria' válido para el cálculo de AHP.")
+                    st.success(f"Consistency ratio AHP = {cr:.3f}. Consistencia aceptable.")
+            weights = getattr(criteria, 'target_weights', None)
+            if weights:
+                st.subheader("Pesos obtenidos por criterio (AHP)")
+                weights_df = pd.DataFrame(list(weights.items()), columns=["Criterio", "Peso"])
+                weights_df["Peso"] = weights_df["Peso"].round(4)
+                st.table(weights_df)
         except Exception as e:
-            st.info(f"No fue posible obtener la consistency_ratio del objeto ahpy: {e}")
+            st.info(f"No fue posible obtener información completa del objeto AHP: {e}")
 
-    else:
-        st.warning("No se generó un objeto 'criteria' válido. Se usaron pesos manuales.")
-
+    # Resultados comparativos
     st.header("Resultados comparativos")
     st.subheader("Tabla de resumen (por SKU)")
     st.dataframe(merged)
 
-    # Mostrar conteos por clase
+    # Conteos por clase
     colA, colB, colC = st.columns(3)
     with colA:
         st.metric("ABC - A count", int((merged['ABC_class']=='A').sum()))
@@ -356,14 +320,12 @@ if st.button("Ejecutar clasificación y métricas"):
 
     # Métricas de similitud
     st.subheader("Métricas de similitud por clase y globales")
-    # Para métricas, usar columnas numéricas escogidas (features)
     merged_for_metrics = merged.copy()
-    # Asegurarse de tener AHP_score y las features normalizadas
     metrics_df, global_indices = compute_similarity_metrics(merged_for_metrics, features=[f'{f}_norm' for f in features], class_col='AHP_class')
     st.dataframe(metrics_df)
     st.write("Índices globales:", global_indices)
 
-    # Boxplots comparativos dinámicos basados en las features elegidas
+    # Boxplots comparativos
     st.subheader("Boxplots comparativos")
 
     # Asegurar que existan features seleccionadas
@@ -454,15 +416,254 @@ if st.button("Ejecutar clasificación y métricas"):
                     except Exception as e:
                         st.warning(f"No se pudo graficar {feature} por ABC_class: {e}")
 
+    # ---------------------------
+    # NUEVO: Procesamiento de archivos Demand / Forecast (si hay)
+    # ---------------------------
+    final_demand_df = None
+    if demand_files and view_mode == 'Labor':
+        st.header("Reclasificación por Demanda / Forecast")
+        st.markdown("Se procesarán los archivos subidos. Si el archivo contiene fechas, se separa por trimestres.")
+        
+        st.markdown("""
+        ### - Criterio de reclasificación
+
+        **¿Cómo se determina la clase final de cada SKU?**
+
+        - **Si el SKU no existe en la tabla de Labor (AHP):**
+            - Se asigna la clasificación de **ABC**.
+                    
+        - **Si el SKU sí existe en Labor (AHP):**
+            - Si la clase **LABOR_AHP** y la clase **ABC** coinciden, se mantiene la de **LABOR**.
+            - Si difieren, se escoge la categoría con mayor prioridad:<br>
+                <b>Prioridad:</b> <span style='color:#1976d2'><b>A</b></span> &gt; <span style='color:#fbc02d'><b>B</b></span> &gt; <span style='color:#d32f2f'><b>C</b></span>
+
+        """, unsafe_allow_html=True)
+
+
+        # Preparar labor_small (solo SKU, LABOR_AHP_class, LABOR_cum_pct)
+        labor_small = ahp_labor_small = None
+        try:
+            labor_small = ahp_summary = None
+            if 'AHP_class' in ahp_summary.columns if 'ahp_summary' in locals() else False:
+                pass
+        except Exception:
+            pass
+
+        # Construir labor_small desde ahp_summary si existe
+        if 'ahp_summary' in locals() and isinstance(ahp_summary, pd.DataFrame):
+            labor_small = ahp_summary[["SKU", "AHP_class", "cum_AHP%"]].copy()
+            labor_small.rename(columns={
+                "AHP_class": "LABOR_AHP_class",
+                "cum_AHP%": "LABOR_cum_pct"
+            }, inplace=True)
+        else:
+            # Si por alguna razón no existe ahp_summary, intentamos obtenerlo desde 'merged'
+            if 'merged' in locals():
+                # merged puede tener AHP_class y cum_AHP%
+                if 'AHP_class' in merged.columns:
+                    labor_small = merged[['SKU', 'AHP_class', 'cum_AHP%']].copy()
+                    labor_small.rename(columns={
+                        "AHP_class": "LABOR_AHP_class",
+                        "cum_AHP%": "LABOR_cum_pct"
+                    }, inplace=True)
+        if labor_small is None or labor_small.empty:
+            st.warning("No se pudo construir labor_small (información AHP de labor). La reclasificación por demanda requiere que AHP para Labor se haya calculado correctamente.")
+        else:
+            all_results = []
+            for f in demand_files:
+                # Leer archivo (xlsx o csv)
+                try:
+                    if f.name.lower().endswith(('.xls', '.xlsx')):
+                        # intentar leer primeras hojas relevantes; si varias hojas, leer la primera
+                        try:
+                            xls = pd.ExcelFile(f)
+                            # Si hay hojas con 'Demand' o 'Forecast' en el nombre, priorizar
+                            sheet_to_use = None
+                            for s in xls.sheet_names:
+                                if any(x in s.lower() for x in ['demand', 'forecast']):
+                                    sheet_to_use = s
+                                    break
+                            if sheet_to_use is None:
+                                sheet_to_use = xls.sheet_names[0]
+                            df_d = pd.read_excel(xls, sheet_name=sheet_to_use)
+                        except Exception as e:
+                            st.warning(f"No se pudo leer {f.name} como Excel: {e}")
+                            continue
+                    else:
+                        # csv
+                        try:
+                            df_d = pd.read_csv(f)
+                        except Exception as e:
+                            st.warning(f"No se pudo leer {f.name} como CSV: {e}")
+                            continue
+
+                    # Normalizar SKU y columnas
+                    if "SKU" in df_d.columns:
+                        df_d["SKU"] = df_d["SKU"].astype(str).str.upper()
+
+                    # Detectar dataset name/label
+                    dataset_label = getattr(f, "name", "UploadedDataset")
+
+                    # Procesar dataset con process_dataset (usa get_quarter_from_date internamente)
+                    try:
+                        res = process_dataset(df_d, labor_small, dataset_name=dataset_label)
+                        if isinstance(res, pd.DataFrame) and not res.empty:
+                            all_results.append(res)
+                        else:
+                            st.info(f"No se generó output para {dataset_label}.")
+                    except Exception as e:
+                        st.warning(f"Error procesando {dataset_label}: {e}")
+                except Exception as e:
+                    st.warning(f"Error leyendo archivo {f.name}: {e}")
+
+            if all_results:
+                final_demand_df = pd.concat(all_results, ignore_index=True)
+                st.subheader("Resumen combinado de reclasificaciones (todos los archivos / trimestres)")
+
+                st.dataframe(final_demand_df)
+
+                # Estadística de cambio
+                total_skus = len(final_demand_df)
+                n_changed = int(final_demand_df["Changed"].sum())
+                pct_changed = 100 * final_demand_df["Changed"].mean() if total_skus>0 else 0.0
+
+                st.metric("Total SKUs procesados", total_skus)
+                st.metric("SKUs cuyo class cambió vs LABOR", f"{n_changed} ({pct_changed:.2f}%)")
+
+                # Pie chart de cambiado / no cambiado
+                st.subheader("Proporción de SKUs que cambiaron su clase por Quarter")
+                
+                quarters = sorted(final_demand_df["Quarter"].unique())
+                n = len(quarters)
+
+                if n == 1:
+                    # Solo uno, normal
+                    df_q = final_demand_df[final_demand_df["Quarter"] == quarters[0]]
+                    pie_q = px.pie(
+                        df_q.groupby("Changed").size().reset_index(name='count'),
+                        names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                        values='count',
+                        title=f"Proporción de SKUs que cambiaron su clase en {quarters[0]}"
+                    )
+                    st.plotly_chart(pie_q, use_container_width=True)
+
+                elif n == 2:
+                    # Dos, lado a lado
+                    cols = st.columns(2)
+                    for i in range(2):
+                        with cols[i]:
+                            df_q = final_demand_df[final_demand_df["Quarter"] == quarters[i]]
+                            pie_q = px.pie(
+                                df_q.groupby("Changed").size().reset_index(name='count'),
+                                names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                                values='count',
+                                title=f"Proporción de SKUs que cambiaron su clase en {quarters[i]}"
+                            )
+                            st.plotly_chart(pie_q, use_container_width=True)
+
+                elif n == 3:
+                    # Dos arriba, uno abajo centrado
+                    cols_top = st.columns(2)
+                    for i in range(2):
+                        with cols_top[i]:
+                            df_q = final_demand_df[final_demand_df["Quarter"] == quarters[i]]
+                            pie_q = px.pie(
+                                df_q.groupby("Changed").size().reset_index(name='count'),
+                                names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                                values='count',
+                                title=f"Proporción de SKUs que cambiaron su clase en {quarters[i]}"
+                            )
+                            st.plotly_chart(pie_q, use_container_width=True)
+                    # Uno abajo centrado
+                    st.write("")  # Espacio
+                    col_center = st.columns([0.25, 0.5, 0.25])
+                    with col_center[1]:
+                        df_q = final_demand_df[final_demand_df["Quarter"] == quarters[2]]
+                        pie_q = px.pie(
+                            df_q.groupby("Changed").size().reset_index(name='count'),
+                            names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                            values='count',
+                            title=f"Proporción de SKUs que cambiaron su clase en {quarters[2]}"
+                        )
+                        st.plotly_chart(pie_q, use_container_width=True)
+
+                elif n == 4:
+                    # Dos arriba, dos abajo
+                    cols_top = st.columns(2)
+                    for i in range(2):
+                        with cols_top[i]:
+                            df_q = final_demand_df[final_demand_df["Quarter"] == quarters[i]]
+                            pie_q = px.pie(
+                                df_q.groupby("Changed").size().reset_index(name='count'),
+                                names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                                values='count',
+                                title=f"Proporción de SKUs que cambiaron su clase en {quarters[i]}"
+                            )
+                            st.plotly_chart(pie_q, use_container_width=True)
+                    cols_bottom = st.columns(2)
+                    for i in range(2, 4):
+                        with cols_bottom[i-2]:
+                            df_q = final_demand_df[final_demand_df["Quarter"] == quarters[i]]
+                            pie_q = px.pie(
+                                df_q.groupby("Changed").size().reset_index(name='count'),
+                                names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                                values='count',
+                                title=f"Proporción de SKUs que cambiaron su clase en {quarters[i]}"
+                            )
+                            st.plotly_chart(pie_q, use_container_width=True)
+
+                else:
+                    # Más de 4: en filas de a 2
+                    for i in range(0, n, 2):
+                        cols = st.columns(2)
+                        for j in range(2):
+                            if i + j < n:
+                                with cols[j]:
+                                    df_q = final_demand_df[final_demand_df["Quarter"] == quarters[i + j]]
+                                    pie_q = px.pie(
+                                        df_q.groupby("Changed").size().reset_index(name='count'),
+                                        names=df_q.groupby("Changed").size().reset_index(name='count')["Changed"].map({True:"Changed", False:"Unchanged"}),
+                                        values='count',
+                                        title=f"Proporción de SKUs que cambiaron su clase en {quarters[i + j]}"
+                                    )
+                                    st.plotly_chart(pie_q, use_container_width=True)
+
+                # Bar chart: count por Source (LABOR/ABC) y por Quarter
+                bar = final_demand_df.groupby(["Quarter","Source"]).size().reset_index(name="count")
+                fig_bar = px.bar(bar, x="Quarter", y="count", color="Source", barmode="group", title="Conteo por Quarter y Source (LABOR/ABC)")
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                # Tabla de detalle (top cambios)
+                st.subheader("Detalle de SKUs que cambiaron (top 50)")
+                changed_df = final_demand_df[final_demand_df["Changed"]].sort_values("Used_Qty", ascending=False)
+                st.dataframe(changed_df.head(50))
+
+                
+            else:
+                st.info("No se generaron resultados a partir de los archivos subidos.")
+
+        if final_demand_df is not None:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                final_demand_df.to_excel(writer, index=False, sheet_name='Reclasificacion')
+            st.download_button(
+                label="Descargar resultado reclasificación (Excel)",
+                data=output.getvalue(),
+                file_name="reclasificacion_demand.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )     
 
 
 
-    # Botón de descarga
-    st.subheader("Descargar resumen")
-    to_download = merged.copy()
-    csv = to_download.to_csv(index=False).encode('utf-8')
-    st.download_button(label="Descargar CSV", data=csv, file_name=f"{view_mode}_summary.csv", mime='text/csv')
+    # Descargar merged principal
+    output_main = io.BytesIO()
+    with pd.ExcelWriter(output_main, engine='xlsxwriter') as writer:
+        merged.to_excel(writer, index=False, sheet_name='ResumenPrincipal')
+    st.download_button(
+        label="Descargar resumen principal (Excel)",
+        data=output_main.getvalue(),
+        file_name=f"{view_mode}_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     st.success("Ejecución completada.")
-
-# Fin del botón ejecutar
