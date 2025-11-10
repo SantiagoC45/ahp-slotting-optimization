@@ -229,10 +229,11 @@ if use_manual_weights:
 # NUEVA SECCIÓN: Upload de archivos de Demand / Forecast
 # ---------------------------
 if view_mode == 'Labor':
-
     st.sidebar.subheader("Demand / Forecast")
     st.sidebar.markdown("Puedes subir uno o varios archivos de demanda/forecast (Excel o CSV). El flujo detecta si el archivo tiene columna fecha o no y procesa por trimestre si aplica.")
     demand_files = st.sidebar.file_uploader("Sube archivos Demand/Forecast (xlsx/csv)", accept_multiple_files=True, type=['xlsx','xls','csv'])
+else:
+    demand_files = None
 
 # Botón ejecutar
 if st.button("Ejecutar clasificación y métricas"):
@@ -420,6 +421,7 @@ if st.button("Ejecutar clasificación y métricas"):
     # NUEVO: Procesamiento de archivos Demand / Forecast (si hay)
     # ---------------------------
     final_demand_df = None
+    
     if demand_files and view_mode == 'Labor':
         st.header("Reclasificación por Demanda / Forecast")
         st.markdown("Se procesarán los archivos subidos. Si el archivo contiene fechas, se separa por trimestres.")
